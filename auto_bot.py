@@ -161,20 +161,24 @@ def analyze_us100():
 
 async def place_order(connection, symbol, direction, price, tp, sl):
     try:
+        options = {"comment": "XauBotAuto", "clientId": "XauBotAuto"}
         if direction == "BUY":
             result = await connection.create_market_buy_order(
-                symbol, LOT_SIZE, sl, tp,
-                {"comment": "XauBotAuto"}
+                symbol, LOT_SIZE, sl, tp, options
             )
         else:
             result = await connection.create_market_sell_order(
-                symbol, LOT_SIZE, sl, tp,
-                {"comment": "XauBotAuto"}
+                symbol, LOT_SIZE, sl, tp, options
             )
         log.info("Ordre place: " + direction + " " + symbol + " @ " + str(price))
         return True
     except Exception as e:
         log.error("Erreur ordre " + symbol + ": " + str(e))
+        send_telegram(
+            os.environ["TELEGRAM_TOKEN"],
+            os.environ["TELEGRAM_CHAT_ID"],
+            "ERREUR ordre " + symbol + ": " + str(e)
+        )
         return False
 
 last_signal = {"XAUUSD": None, "US100": None}
@@ -222,28 +226,8 @@ async def main():
 
             await asyncio.sleep(5)
 
-            # US100
-            us = analyze_us100()
-            if us:
-                direction, price, tp, sl, ind = us
-                key = direction + "_" + str(round(price, 0))
-                if last_signal["US100"] != key:
-                    success = await place_order(connection, US100_CONFIG["mt5_symbol"], direction, price, tp, sl)
-                    if success:
-                        rr  = round(abs(tp - price) / abs(sl - price), 2)
-                        now = datetime.utcnow().strftime("%H:%M UTC")
-                        msg  = direction + " AUTO - US100\n"
-                        msg += "Heure  : " + now + "\n"
-                        msg += "Entry  : " + str(price) + "\n"
-                        msg += "TP     : " + str(tp) + "\n"
-                        msg += "SL     : " + str(sl) + "\n"
-                        msg += "RR     : 1:" + str(rr) + "\n"
-                        msg += "RSI    : " + str(ind) + "\n"
-                        msg += "Ordre place automatiquement sur MT5"
-                        send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
-                        last_signal["US100"] = key
-            else:
-                last_signal["US100"] = None
+            # US100 desactive - plan Twelve Data insuffisant
+            # us = analyze_us100()
 
         except Exception as e:
             log.error("Erreur scan: " + str(e))
