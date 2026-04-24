@@ -173,11 +173,16 @@ async def place_order(connection, symbol, direction, price, tp, sl):
         log.info("Ordre place: " + direction + " " + symbol + " @ " + str(price))
         return True
     except Exception as e:
-        log.error("Erreur ordre " + symbol + ": " + str(e))
+        error_details = str(e)
+        if hasattr(e, "details"):
+            error_details += " | Details: " + str(e.details)
+        if hasattr(e, "numeric_code"):
+            error_details += " | Code: " + str(e.numeric_code)
+        log.error("Erreur ordre " + symbol + ": " + error_details)
         send_telegram(
             os.environ["TELEGRAM_TOKEN"],
             os.environ["TELEGRAM_CHAT_ID"],
-            "ERREUR ordre " + symbol + ": " + str(e)
+            "ERREUR ordre " + symbol + ": " + error_details
         )
         return False
 
