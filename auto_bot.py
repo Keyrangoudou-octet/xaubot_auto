@@ -161,7 +161,7 @@ def analyze_us100():
 
 async def place_order(connection, symbol, direction, price, tp, sl):
     try:
-        options = {"comment": "XauBotAuto", "clientId": "XauBotAuto"}
+        options = {"comment": "XauBotAuto", "clientId": "xaubotauto001"}
         if direction == "BUY":
             result = await connection.create_market_buy_order(
                 symbol, LOT_SIZE, sl, tp, options
