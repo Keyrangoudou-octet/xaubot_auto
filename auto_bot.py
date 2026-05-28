@@ -274,19 +274,21 @@ def analyze_xauusd():
     if sweep_dir is None:
         return None
 
-    # Le sweep doit être dans le sens du biais (on cherche un BUY sweep en tendance BULL)
-    if sweep_dir != h4_bias:
-        log.info("Sweep " + sweep_dir + " contre biais H4 " + h4_bias + " - ignoré")
+    # En SMC : sweep SELL (percée swing high) = setup BUY
+    #          sweep BUY  (percée swing low)  = setup SELL
+    trade_dir = "BUY" if sweep_dir == "SELL" else "SELL"
+
+    if trade_dir != h4_bias:
+        log.info("Trade " + trade_dir + " (sweep " + sweep_dir + ") contre biais H4 " + h4_bias + " - ignoré")
         return None
 
     # ── 5. Confirmation CHoCH / BOS ──
-    confirmed = detect_choch_bos(df, sweep_dir)
+    confirmed = detect_choch_bos(df, trade_dir)
     if not confirmed:
-        log.info("CHoCH/BOS non confirmé pour " + sweep_dir)
-        return None
+        log.info("CHoCH/BOS non confirmé pour " + trade_dir)
 
     # ── 6. Order Block ──
-    ob_high, ob_low = find_order_block(df, sweep_dir)
+    ob_high, ob_low = find_order_block(df, trade_dir)
     if ob_high is None:
         ob_high = round(price + atr_now, 2)
         ob_low  = round(price - atr_now, 2)
@@ -294,7 +296,7 @@ def analyze_xauusd():
     # ── 7. Calcul SL et TP ──
     sl_dist = round(atr_now * cfg["atr_sl_mult"], 2)
 
-    if sweep_dir == "BUY":
+    if trade_dir == "BUY":
         sl  = round(price - sl_dist, 2)
         tp1 = round(price + sl_dist * 2, 2)   # RR 1:2
         tp2 = round(price + sl_dist * 3, 2)   # RR 1:3
@@ -307,7 +309,7 @@ def analyze_xauusd():
         tp3 = round(price - sl_dist * 5, 2)
 
     return {
-        "direction"  : sweep_dir,
+        "direction"  : trade_dir,
         "price"      : price,
         "sl"         : sl,
         "tp1"        : tp1,
