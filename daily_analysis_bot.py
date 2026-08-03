@@ -1,407 +1,175 @@
-# XauBot Signal Bot - Railway / Twelve Data
-# Stratégie SMC (Smart Money Concepts) - XAUUSD M5
-# v5 : Biais H4 + Filtre H1 + Liquidity Sweep + CHoCH/BOS + Order Block + SL ATR + TP RR 1:3/1:5
+# XauBot - Analyse Daily XAUUSD
+# Tendance Daily (HH/HL/LH/LL) + Niveaux Clés + Proximité Prix
+# v1.0 - KG Group
 
-import asyncio
-import logging
 import os
 import requests
-import pandas as pd
-from datetime import datetime, timezone
-from telegram import Bot
+from datetime import datetime
 
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
 
-SCAN_INTERVAL = 300
+SYMBOL          = "XAU/USD"
+SWING_WINDOW    = 3    # bougies de chaque côté pour valider un swing
+LEVEL_TOLERANCE = 10   # $10 de tolérance pour regrouper les niveaux
+MIN_TOUCHES     = 2    # touches minimum pour valider un niveau clé
+PROXIMITY_DIST  = 15   # $15 pour considérer le prix "proche" d'un niveau
 
-# Sessions de trading (UTC)
-SESSION_LONDON_START = 8
-SESSION_LONDON_END   = 17
-SESSION_NY_START     = 13
-SESSION_NY_END       = 22
-
-CONFIG = {
-    "symbol"         : "XAU/USD",
-    "atr_period"     : 14,
-    "atr_sl_mult"    : 1.5,
-    "swing_lookback" : 10,   # bougies pour détecter les swings highs/lows
-    "sweep_buffer"   : 0.05, # % de l'ATR pour valider la percée du swing
-}
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger(__name__)
-
-# ─────────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────────
-
-def is_market_open():
-    now_utc = datetime.now(timezone.utc)
-    if now_utc.weekday() >= 5:
-        return False
-    hour = now_utc.hour
-    return (SESSION_LONDON_START <= hour < SESSION_LONDON_END) or \
-           (SESSION_NY_START     <= hour < SESSION_NY_END)
-
-def get_candles(symbol, interval="5min", outputsize=150):
-    try:
-        url = "https://api.twelvedata.com/time_series"
-        params = {
-            "symbol"    : symbol,
-            "interval"  : interval,
-            "outputsize": outputsize,
-            "apikey"    : TWELVE_API_KEY,
-            "format"    : "JSON"
-        }
-        r    = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if "values" not in data:
-            log.error("Twelve Data erreur [" + interval + "]: " + str(data.get("message", "unknown")))
-            return None
-        df = pd.DataFrame(data["values"])
-        df = df.rename(columns={"datetime": "time"})
-        for col in ["open", "high", "low", "close"]:
-            df[col] = pd.to_numeric(df[col])
-        df = df.iloc[::-1].reset_index(drop=True)
-        return df
-    except Exception as e:
-        log.error("get_candles [" + interval + "]: " + str(e))
-        return None
-
-# ─────────────────────────────────────────────
-# INDICATEURS
-# ─────────────────────────────────────────────
-
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def atr(df, period=14):
-    high  = df["high"]
-    low   = df["low"]
-    close = df["close"]
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-# ─────────────────────────────────────────────
-# BIAIS H4 - STRUCTURE DE MARCHÉ
-# ─────────────────────────────────────────────
-
-def get_h4_bias(symbol):
-    """
-    Détecte le biais H4 via la structure de marché (HH/HL ou LH/LL)
-    sur les 5 derniers swings highs et lows.
-    Retourne 'BULL', 'BEAR' ou None
-    """
-    df = get_candles(symbol, interval="4h", outputsize=60)
-    if df is None or len(df) < 20:
-        return None
-
-    # Identifier les swings highs et lows sur H4
-    highs = []
-    lows  = []
-    for i in range(2, len(df) - 2):
-        h = float(df["high"].iloc[i])
-        l = float(df["low"].iloc[i])
-        # Swing high : bougie avec un high supérieur aux 2 bougies de chaque côté
-        if h > float(df["high"].iloc[i-1]) and h > float(df["high"].iloc[i-2]) and \
-           h > float(df["high"].iloc[i+1]) and h > float(df["high"].iloc[i+2]):
-            highs.append(h)
-        # Swing low : bougie avec un low inférieur aux 2 bougies de chaque côté
-        if l < float(df["low"].iloc[i-1])  and l < float(df["low"].iloc[i-2]) and \
-           l < float(df["low"].iloc[i+1])  and l < float(df["low"].iloc[i+2]):
-            lows.append(l)
-
-    if len(highs) < 2 or len(lows) < 2:
-        return None
-
-    # Prendre les 2 derniers swings
-    last_hh  = highs[-1] > highs[-2]  # Higher High
-    last_hl  = lows[-1]  > lows[-2]   # Higher Low
-    last_lh  = highs[-1] < highs[-2]  # Lower High
-    last_ll  = lows[-1]  < lows[-2]   # Lower Low
-
-    if last_hh and last_hl:
-        return "BULL"
-    if last_lh and last_ll:
-        return "BEAR"
-    return None  # Structure indéfinie (range)
-
-# ─────────────────────────────────────────────
-# FILTRE H1
-# ─────────────────────────────────────────────
-
-def get_h1_trend(symbol):
-    df = get_candles(symbol, interval="1h", outputsize=60)
-    if df is None or len(df) < 55:
-        return None
-    df["ema_fast"] = ema(df["close"], 15)
-    df["ema_slow"] = ema(df["close"], 50)
-    if float(df["ema_fast"].iloc[-1]) > float(df["ema_slow"].iloc[-1]):
-        return "BULL"
-    return "BEAR"
-
-# ─────────────────────────────────────────────
-# DÉTECTION LIQUIDITY SWEEP
-# ─────────────────────────────────────────────
-
-def detect_liquidity_sweep(df, atr_now, cfg):
-    """
-    Détecte un liquidity sweep sur M5 :
-    - Prix perce brièvement le dernier swing high/low
-    - Puis revient de l'autre côté (close en dessous du swing high ou au dessus du swing low)
-    Retourne : ('BUY', sweep_level) si sweep baissier suivi de retournement haussier
-               ('SELL', sweep_level) si sweep haussier suivi de retournement baissier
-               (None, None) sinon
-    """
-    lookback = cfg["swing_lookback"]
-    buffer   = atr_now * cfg["sweep_buffer"]
-
-    # Bougies de référence pour trouver le swing (hors 3 dernières bougies)
-    ref_candles = df.iloc[-(lookback + 3):-3]
-    last        = df.iloc[-1]
-    prev        = df.iloc[-2]
-
-    swing_high = float(ref_candles["high"].max())
-    swing_low  = float(ref_candles["low"].min())
-
-    close_last = float(last["close"])
-    high_last  = float(last["high"])
-    low_last   = float(last["low"])
-
-    # Sweep haussier : la bougie a percé le swing high mais a clôturé en dessous → SELL setup
-    if high_last > swing_high + buffer and close_last < swing_high:
-        log.info("Liquidity sweep SELL détecté @ swing_high=" + str(round(swing_high, 2)))
-        return "SELL", round(swing_high, 2)
-
-    # Sweep baissier : la bougie a percé le swing low mais a clôturé au dessus → BUY setup
-    if low_last < swing_low - buffer and close_last > swing_low:
-        log.info("Liquidity sweep BUY détecté @ swing_low=" + str(round(swing_low, 2)))
-        return "BUY", round(swing_low, 2)
-
-    return None, None
-
-# ─────────────────────────────────────────────
-# DÉTECTION CHoCH / BOS
-# ─────────────────────────────────────────────
-
-def detect_choch_bos(df, direction):
-    """
-    Après un sweep, confirme le retournement via CHoCH ou BOS sur M5 :
-    - BUY : la dernière bougie casse le dernier swing high intermédiaire (structure haussière)
-    - SELL : la dernière bougie casse le dernier swing low intermédiaire (structure baissière)
-    """
-    # On prend les 10 dernières bougies pour trouver le swing intermédiaire
-    recent = df.iloc[-10:-1]
-    last   = df.iloc[-1]
-
-    if direction == "BUY":
-        # Cherche le dernier swing high intermédiaire
-        interim_high = float(recent["high"].max())
-        if float(last["close"]) > interim_high:
-            log.info("CHoCH/BOS BUY confirmé - close " + str(round(float(last["close"]), 2)) + " > interim_high " + str(round(interim_high, 2)))
-            return True
-    elif direction == "SELL":
-        # Cherche le dernier swing low intermédiaire
-        interim_low = float(recent["low"].min())
-        if float(last["close"]) < interim_low:
-            log.info("CHoCH/BOS SELL confirmé - close " + str(round(float(last["close"]), 2)) + " < interim_low " + str(round(interim_low, 2)))
-            return True
-
-    return False
-
-# ─────────────────────────────────────────────
-# DÉTECTION ORDER BLOCK
-# ─────────────────────────────────────────────
-
-def find_order_block(df, direction):
-    """
-    Trouve l'Order Block : dernière bougie de couleur opposée avant l'impulsion.
-    - BUY OB : dernière bougie baissière (close < open) avant le move haussier
-    - SELL OB : dernière bougie haussière (close > open) avant le move baissier
-    Retourne (ob_high, ob_low) ou (None, None)
-    """
-    # On cherche dans les 15 dernières bougies
-    for i in range(2, 16):
-        candle = df.iloc[-i]
-        o = float(candle["open"])
-        c = float(candle["close"])
-        h = float(candle["high"])
-        l = float(candle["low"])
-
-        if direction == "BUY" and c < o:   # bougie baissière = BUY order block
-            return round(h, 2), round(l, 2)
-        if direction == "SELL" and c > o:  # bougie haussière = SELL order block
-            return round(h, 2), round(l, 2)
-
-    return None, None
-
-# ─────────────────────────────────────────────
-# ANALYSE PRINCIPALE
-# ─────────────────────────────────────────────
-
-def analyze_xauusd():
-    cfg = CONFIG
-
-    # ── 1. Biais H4 ──
-    h4_bias = get_h4_bias(cfg["symbol"])
-    if h4_bias is None:
-        log.info("Biais H4 indéfini - marché en range sur H4")
-        return None
-
-    # ── 2. Filtre H1 aligné avec H4 ──
-    h1_trend = get_h1_trend(cfg["symbol"])
-    if h1_trend is None or h1_trend != h4_bias:
-        log.info("H1 (" + str(h1_trend) + ") non aligné avec H4 (" + str(h4_bias) + ") - signal ignoré")
-        return None
-
-    # ── 3. Données M5 ──
-    df = get_candles(cfg["symbol"], interval="5min", outputsize=150)
-    if df is None or len(df) < 50:
-        return None
-
-    df["atr"] = atr(df, cfg["atr_period"])
-    atr_now   = float(df["atr"].iloc[-1])
-    price     = round(float(df["close"].iloc[-1]), 2)
-
-    # ── 4. Liquidity Sweep ──
-    sweep_dir, sweep_level = detect_liquidity_sweep(df, atr_now, cfg)
-    if sweep_dir is None:
-        return None
-
-    # En SMC : sweep SELL (percée swing high) = setup BUY
-    #          sweep BUY  (percée swing low)  = setup SELL
-    trade_dir = "BUY" if sweep_dir == "SELL" else "SELL"
-
-    if trade_dir != h4_bias:
-        log.info("Trade " + trade_dir + " (sweep " + sweep_dir + ") contre biais H4 " + h4_bias + " - ignoré")
-        return None
-
-    # ── 5. Confirmation CHoCH / BOS ──
-    confirmed = detect_choch_bos(df, trade_dir)
-    if not confirmed:
-        log.info("CHoCH/BOS non confirmé pour " + trade_dir)
-
-    # ── 6. Order Block ──
-    ob_high, ob_low = find_order_block(df, trade_dir)
-    if ob_high is None:
-        ob_high = round(price + atr_now, 2)
-        ob_low  = round(price - atr_now, 2)
-
-    # ── 7. Calcul SL et TP ──
-    sl_dist = round(atr_now * cfg["atr_sl_mult"], 2)
-
-    if trade_dir == "BUY":
-        sl  = round(price - sl_dist, 2)
-        tp1 = round(price + sl_dist * 2, 2)   # RR 1:2
-        tp2 = round(price + sl_dist * 3, 2)   # RR 1:3
-        tp3 = round(price + sl_dist * 5, 2)   # RR 1:5
-
-    else:  # SELL
-        sl  = round(price + sl_dist, 2)
-        tp1 = round(price - sl_dist * 2, 2)
-        tp2 = round(price - sl_dist * 3, 2)
-        tp3 = round(price - sl_dist * 5, 2)
-
-    return {
-        "direction"  : trade_dir,
-        "price"      : price,
-        "sl"         : sl,
-        "tp1"        : tp1,
-        "tp2"        : tp2,
-        "tp3"        : tp3,
-        "sl_dist"    : sl_dist,
-        "sweep_level": sweep_level,
-        "ob_high"    : ob_high,
-        "ob_low"     : ob_low,
-        "h4_bias"    : h4_bias,
-        "h1_trend"   : h1_trend,
-        "atr"        : round(atr_now, 2),
+# ─── DONNÉES API ───────────────────────────────────────────────────────────────
+def get_daily_candles(outputsize=100):
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": SYMBOL,
+        "interval": "1day",
+        "outputsize": outputsize,
+        "apikey": TWELVE_API_KEY,
+        "order": "ASC"
     }
+    r = requests.get(url, params=params, timeout=30)
+    data = r.json()
+    if "values" not in data:
+        raise ValueError(f"Erreur API: {data.get('message', data)}")
+    return data["values"]
 
-# ─────────────────────────────────────────────
-# FORMAT MESSAGE
-# ─────────────────────────────────────────────
+# ─── DÉTECTION SWINGS ──────────────────────────────────────────────────────────
+def detect_swings(candles, window=3):
+    highs_list = [float(c["high"]) for c in candles]
+    lows_list  = [float(c["low"])  for c in candles]
+    n = len(candles)
+    swing_highs = []
+    swing_lows  = []
 
-def format_message(s):
-    now   = datetime.utcnow().strftime("%H:%M UTC")
-    arrow = "🟢" if s["direction"] == "BUY" else "🔴"
+    for i in range(window, n - window):
+        h = highs_list[i]
+        l = lows_list[i]
+        if all(h >= highs_list[i-j] for j in range(1, window+1)) and \
+           all(h >= highs_list[i+j] for j in range(1, window+1)):
+            swing_highs.append(h)
+        if all(l <= lows_list[i-j] for j in range(1, window+1)) and \
+           all(l <= lows_list[i+j] for j in range(1, window+1)):
+            swing_lows.append(l)
+    return swing_highs, swing_lows
 
-    msg  = arrow + " " + s["direction"] + " SIGNAL - XAUUSD\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "🕐 Heure        : " + now + "\n"
-    msg += "📍 Entry        : " + str(s["price"]) + "\n"
-    msg += "🛑 SL           : " + str(s["sl"]) + "  (-" + str(s["sl_dist"]) + ")\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "🎯 TP1          : " + str(s["tp1"]) + "  (RR 1:2)\n"
-    msg += "🎯 TP2          : " + str(s["tp2"]) + "  (RR 1:3)\n"
-    msg += "🎯 TP3          : " + str(s["tp3"]) + "  (RR 1:5)\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "💧 Sweep        : " + str(s["sweep_level"]) + "\n"
-    msg += "📦 Order Block  : " + str(s["ob_low"]) + " - " + str(s["ob_high"]) + "\n"
-    msg += "📊 ATR          : " + str(s["atr"]) + "\n"
-    msg += "📈 H1           : " + s["h1_trend"] + "\n"
-    msg += "📊 H4           : " + s["h4_bias"] + "\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "⚠️ Signal indicatif - vérifiez sur MT5"
-    return msg
+# ─── STRUCTURE DE MARCHÉ ───────────────────────────────────────────────────────
+def detect_structure(swing_highs, swing_lows):
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "INDÉCIS", "Structure insuffisante"
 
-# ─────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────
+    sh1, sh2 = swing_highs[-2], swing_highs[-1]
+    sl1, sl2 = swing_lows[-2],  swing_lows[-1]
 
-last_signal = None
+    if sh2 > sh1 and sl2 > sl1:
+        return "HAUSSIER", f"HH {sh2:.0f} > {sh1:.0f}  |  HL {sl2:.0f} > {sl1:.0f}"
+    elif sh2 < sh1 and sl2 < sl1:
+        return "BAISSIER", f"LH {sh2:.0f} < {sh1:.0f}  |  LL {sl2:.0f} < {sl1:.0f}"
+    elif sh2 > sh1 and sl2 < sl1:
+        return "INDÉCIS", "HH confirmé mais LL — structure mixte"
+    else:
+        return "INDÉCIS", "LH confirmé mais HL — structure mixte"
 
-async def main():
-    bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=(
-            "🤖 XauBot Signal v5 - SMC démarré\n"
-            "XAUUSD - Sessions Londres + New York\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "✅ Biais H4 (structure HH/HL)\n"
-            "✅ Filtre H1 (EMA 15/50)\n"
-            "💧 Liquidity Sweep M5\n"
-            "🔄 CHoCH / BOS confirmation\n"
-            "📦 Order Block detection\n"
-            "🎯 TP RR 1:2 / 1:3 / 1:5"
-        )
+# ─── NIVEAUX CLÉS ──────────────────────────────────────────────────────────────
+def find_key_levels(swing_highs, swing_lows, tolerance=10, min_touches=2):
+    all_levels = sorted(swing_highs + swing_lows)
+    if not all_levels:
+        return []
+    clusters = [[all_levels[0]]]
+    for level in all_levels[1:]:
+        if level - clusters[-1][-1] <= tolerance:
+            clusters[-1].append(level)
+        else:
+            clusters.append([level])
+    key_levels = []
+    for cluster in clusters:
+        if len(cluster) >= min_touches:
+            avg = sum(cluster) / len(cluster)
+            key_levels.append((round(avg, 1), len(cluster)))
+    return key_levels
+
+# ─── PROXIMITÉ DU PRIX ─────────────────────────────────────────────────────────
+def check_proximity(price, key_levels, max_dist=15):
+    nearby = []
+    for level, touches in key_levels:
+        dist = abs(price - level)
+        if dist <= max_dist:
+            nearby.append((level, touches, price - level))
+    return nearby
+
+# ─── CONSTRUCTION MESSAGE ──────────────────────────────────────────────────────
+def build_message(trend, detail, key_levels, price, nearby):
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    if trend == "HAUSSIER":
+        t_emoji, bias = "📈", "Privilégier <b>BUY</b>"
+    elif trend == "BAISSIER":
+        t_emoji, bias = "📉", "Privilégier <b>SELL</b>"
+    else:
+        t_emoji, bias = "↔️", "Prudence — attendre confirmation"
+
+    if key_levels:
+        sorted_by_prox = sorted(key_levels, key=lambda x: abs(x[0] - price))
+        displayed = sorted(sorted_by_prox[:8], key=lambda x: x[0])
+        levels_str = "  ".join([f"<b>{int(l[0])}</b>({l[1]}x)" for l in displayed])
+    else:
+        levels_str = "Aucun niveau identifié"
+
+    if nearby:
+        prox_lines = []
+        for level, touches, dist in nearby:
+            direction = "au-dessus" if dist > 0 else "en-dessous"
+            prox_lines.append(f"⚠️ Niveau <b>{int(level)}</b> ({touches} touches) — {abs(dist):.0f}$ {direction}")
+        setup_block = "\n".join(prox_lines)
+        conclusion  = "✅ Setup possible — attends confirmation signal v16"
+    else:
+        setup_block = "Aucun niveau proche"
+        conclusion  = "⛔ Prix au milieu de nulle part — marché indécis\nProbablement pas de trade aujourd'hui"
+
+    return (
+        f"📊 <b>XAUUSD — Analyse Daily</b>\n"
+        f"🕐 {now}\n\n"
+        f"<b>Tendance :</b> {t_emoji} {trend}\n"
+        f"<i>{detail}</i>\n"
+        f"{bias}\n\n"
+        f"<b>Niveaux clés :</b>\n"
+        f"{levels_str}\n\n"
+        f"<b>Prix actuel :</b> {price:.0f}$\n"
+        f"{setup_block}\n\n"
+        f"{conclusion}\n"
+        f"──────────────\n"
+        f"<i>Bot Daily v1 — KG Group</i>"
     )
-    log.info("Bot démarré v5 - SMC")
 
-    while True:
-        try:
-            if not is_market_open():
-                log.info("Marché fermé - attente")
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
+# ─── ENVOI TELEGRAM ────────────────────────────────────────────────────────────
+def send_telegram(message):
+    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Erreur Telegram : {e}")
+        return False
 
-            result = analyze_xauusd()
-            if result:
-                key = result["direction"] + "_" + str(round(result["price"], 0))
-                if last_signal != key:
-                    msg = format_message(result)
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-                    last_signal = key
-                    log.info(
-                        "Signal SMC: " + result["direction"] +
-                        " @ " + str(result["price"]) +
-                        " | H4: " + result["h4_bias"] +
-                        " | Sweep: " + str(result["sweep_level"])
-                    )
-            else:
-                last_signal = None
-
-        except Exception as e:
-            log.error("Erreur scan: " + str(e))
-
-        await asyncio.sleep(SCAN_INTERVAL)
+# ─── MAIN ──────────────────────────────────────────────────────────────────────
+def main():
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Bot Daily XAUUSD démarré")
+    try:
+        candles = get_daily_candles(outputsize=100)
+        price   = float(candles[-1]["close"])
+        swing_highs, swing_lows = detect_swings(candles, window=SWING_WINDOW)
+        trend, detail = detect_structure(swing_highs, swing_lows)
+        key_levels = find_key_levels(swing_highs, swing_lows,
+                                     tolerance=LEVEL_TOLERANCE,
+                                     min_touches=MIN_TOUCHES)
+        nearby  = check_proximity(price, key_levels, max_dist=PROXIMITY_DIST)
+        message = build_message(trend, detail, key_levels, price, nearby)
+        send_telegram(message)
+        print("Envoyé ✅")
+    except Exception as e:
+        err = f"❌ Bot Daily XAUUSD — Erreur:\n{str(e)}"
+        print(err)
+        send_telegram(err)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
